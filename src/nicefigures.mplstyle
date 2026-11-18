@@ -1,0 +1,16 @@
+# BLUE, RED, GREEN, YELLOW, BLACK
+axes.prop_cycle : cycler('color', ['0C5DA5', 'FF2C00', '00B945', 'FF9500', '1F1F1F'])
+
+
+figure.figsize : 7.20, 4.80
+figure.dpi : 300
+legend.frameon : False
+xtick.direction : in
+ytick.direction : in
+
+lines.linewidth : 1
+lines.markersize : 4
+
+font.family:  serif
+font.serif:   STIXGeneral
+mathtext.fontset : stix
