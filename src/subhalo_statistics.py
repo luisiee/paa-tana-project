@@ -13,8 +13,6 @@ import numpy as np
 from astropy import units
 from scipy.spatial import cKDTree
 
-HERE = Path(__file__).resolve().parent
-
 # -------------- DATA ----------------
 
 
@@ -44,7 +42,7 @@ def get_subhalo_data(tng_path, min_mass=0.0):
     return box_size, positions[keep], masses[keep]
 
 
-def sample_positions(positions, max_halos=20_000, rng_seed=7):
+def sample_positions(positions, max_halos=20_000, rng_seed=42):
     """Uniformly subsample positions, or keep all when max_halos is zero."""
     if max_halos < 0:
         raise ValueError("max_halos must be non-negative")
@@ -84,7 +82,7 @@ def get_correlation_estimators(
     bins=16,
     random_to_sim=1,
     max_random=100_000,
-    rng_seed=7,
+    rng_seed=42,
 ):
     """Natural (analytic RR) and Landy-Szalay xi(r) in periodic spherical shells."""
     n_data = len(positions)
@@ -102,8 +100,8 @@ def get_correlation_estimators(
     data_tree = cKDTree(_wrap(positions, box_size), boxsize=box_size)
     dd = _pair_histogram(data_tree, data_tree, edges, same_catalog=True)
 
-    # random catalogue, between 20,000 and max_random points
-    n_random = min(max(int(random_to_sim * n_data), 20_000), max_random)
+    # random catalogue, between random_to_sim * n_data and max_random points
+    n_random = min(int(random_to_sim * n_data), max_random)
     rng = np.random.default_rng(rng_seed)
     random_tree = cKDTree(rng.uniform(0.0, box_size, size=(n_random, 3)), boxsize=box_size)
     dr = _pair_histogram(data_tree, random_tree, edges)
@@ -127,8 +125,13 @@ def get_correlation_estimators(
 # --------------- PLOTTING -----------------
 
 
-def plot_mass_function(masses, box_size, bins=30, output=None):
-    """Differential and cumulative subhalo mass function per cMpc^3."""
+def plot_mass_function(
+    masses, box_size, bins=30, output=None, min_cumulative_density=1e-3
+):
+    """Plot differential and cumulative mass functions with a fitted slope."""
+    if not np.isfinite(min_cumulative_density) or min_cumulative_density < 0:
+        raise ValueError("min_cumulative_density must be finite and non-negative")
+
     logm = np.log10(masses)
     lo, hi = logm.min(), logm.max()
     if lo == hi:
@@ -149,7 +152,35 @@ def plot_mass_function(masses, box_size, bins=30, output=None):
     axs[0].set_xlabel(r"$M_{\rm sub}$ $[M_\odot]$")
     axs[0].set_ylabel(r"$dn/d\log_{10}(M/M_\odot)$ $[\mathrm{cMpc}^{-3}]$")
     axs[0].set_title("Subhalo mass function")
-    axs[1].step(masses_sorted, n_cumulative, where="post")
+    axs[1].step(masses_sorted, n_cumulative, where="post", label="cumulative data")
+
+    # fit to cumulative function
+    if masses_sorted[0] < masses_sorted[-1]:
+        fit_masses = np.geomspace(
+            masses_sorted[0], masses_sorted[-1], num=min(1000, len(masses_sorted))
+        )
+        fit_counts = len(masses_sorted) - np.searchsorted(
+            masses_sorted, fit_masses, side="left"
+        )
+        fit_density = fit_counts / box_size**3
+        fit_mask = fit_density > min_cumulative_density
+        if fit_mask.sum() >= 2:
+            slope, intercept = np.polyfit(
+                np.log10(fit_masses[fit_mask]), np.log10(fit_density[fit_mask]), deg=1
+            )
+            axs[1].plot(
+                fit_masses,
+                10 ** (slope * np.log10(fit_masses) + intercept),
+                "--",
+                label=f"power-law fit (slope = {slope:.2f})",
+            )
+            axs[1].legend()
+        else:
+            print(
+                "Note: fewer than two cumulative mass-function points exceed "
+                f"{min_cumulative_density:g} cMpc^-3; skipping the fit."
+            )
+
     axs[1].set_xlabel(r"$M_{\rm sub}$ $[M_\odot]$")
     axs[1].set_ylabel(r"$n(>M_{\rm sub})$ $[\mathrm{cMpc}^{-3}]$")
     axs[1].set_title("Cumulative subhalo mass function")
@@ -161,10 +192,15 @@ def plot_mass_function(masses, box_size, bins=30, output=None):
     fig.tight_layout()
     if output is not None:
         fig.savefig(output)
-    return fig
 
 
-def plot_correlation_function(positions, box_size, output=None, **kwargs):
+def plot_correlation_function(
+    positions, box_size, output=None, xi_fit_max=8.0, **kwargs
+):
+    """Plot correlation estimators and fit the natural estimator below xi_fit_max."""
+    if not np.isfinite(xi_fit_max) or xi_fit_max <= 0:
+        raise ValueError("xi_fit_max must be a finite positive value")
+
     radii, natural, ls = get_correlation_estimators(
         positions, box_size, **kwargs
     )
@@ -178,41 +214,61 @@ def plot_correlation_function(positions, box_size, output=None, **kwargs):
             "bins with xi <= 0 (cannot be shown on a log axis)."
         )
 
-    fig, ax = plt.subplots()
-    ax.plot(radii[ok_nat], natural[ok_nat], "D-", label="natural (analytic RR)")
-    ax.plot(radii[ok_ls], ls[ok_ls], "s-", label="Landy–Szalay")
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel(r"$r$ [$\mathrm{cMpc}$]")
-    ax.set_ylabel(r"$\xi(r)$")
-    ax.set_title("Subhalo autocorrelation function")
-    ax.legend()
+    # we also plot the chi2 / len(radii) for different sizes of random catalogues
+    # to see that the LS estimator converges to the natural estimator for pbc
+    low_naturals, low_ls = np.zeros((2, 5, natural.size), dtype=float)
+    low_naturals[0] = natural
+    low_ls[0] = ls
+    for i, random_to_sim in enumerate([0.8, 0.6, 0.4, 0.2]):
+        _, this_natural, this_ls = get_correlation_estimators(positions, box_size, random_to_sim=random_to_sim, **kwargs)
+        low_naturals[i+1] = this_natural
+        low_ls[i+1] = this_ls
+
+    reduced_chi2s = np.sum((low_naturals - low_ls)**2, axis=1, keepdims=False) / len(radii)
+
+    fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
+    axs[0].plot(radii[ok_nat], natural[ok_nat], "D-", label="natural (analytic RR)")
+    axs[0].plot(radii[ok_ls], ls[ok_ls], "s-", label="Landy–Szalay")
+    axs[0].set_xscale("log")
+    axs[0].set_yscale("log")
+    axs[0].set_xlabel(r"$r$ [$\mathrm{cMpc}$]")
+    axs[0].set_ylabel(r"$\xi(r)$")
+    axs[0].set_title("Subhalo autocorrelation function")
+
+    axs[1].plot(np.array([1.0, 0.8, 0.6, 0.4, 0.2]), reduced_chi2s, "D-")
+    axs[1].set_yscale("log")
+    axs[1].set_xlabel(r"$N_\mathrm{R} / N_\mathrm{D}$")
+    axs[1].set_ylabel(r"$\sum_r (\xi_\mathrm{LS}(r) - \xi_\mathrm{nat}(r))^2 / N_\mathrm{bins}$")
+    axs[1].set_title("Comparison between natural & Landy-Szalay")
+
+    # fit to natural estimator
+    fit_nat = ok_nat & (natural <= xi_fit_max)
+    if fit_nat.sum() >= 2:
+        slope, intercept = np.polyfit(
+            np.log10(radii[fit_nat]), np.log10(natural[fit_nat]), deg=1
+        )
+        if slope != 0:
+            max_xi_radius = 10 ** (
+                (np.log10(natural[ok_nat].max()) - intercept) / slope
+            )
+            fit_radii = np.geomspace(
+                min(max_xi_radius, radii[fit_nat].min()),
+                max(max_xi_radius, radii[fit_nat].max()),
+                100,
+            )
+            axs[0].plot(
+                fit_radii,
+                10 ** (slope * np.log10(fit_radii) + intercept),
+                "--",
+                label=f"natural fit ($\\xi \\leq {xi_fit_max:g}$, slope = {slope:.2f})",
+            )
+    else:
+        print(
+            f"Note: fewer than two finite positive natural-estimator bins have "
+            f"xi <= {xi_fit_max:g}; skipping the fit."
+        )
+    axs[0].legend()
+
     fig.tight_layout()
     if output is not None:
         fig.savefig(output)
-    return fig
-
-
-# --------------- MAIN -----------------
-
-if __name__ == "__main__":
-    data_path = HERE.parent / "data" / "TNG50-1-Dark_subhalosCat.hdf5"
-    output_dir = Path("figures")
-    min_mass = 0.0                  # minimum subhalo mass in Msun (0 = no cut)
-    max_correlation_halos = 20_000  # subsample size for xi(r); 0 uses all subhalos
-
-    style = HERE / "nicefigures.mplstyle"
-    if style.exists():
-        plt.style.use(style)
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    box_size, positions, masses = get_subhalo_data(data_path, min_mass=min_mass)
-    print(f"Box size: {box_size:.2f} cMpc, {len(masses)} subhalos after selection")
-
-    plot_mass_function(masses, box_size,
-        output=output_dir / "subhalo_mass_function.png")
-
-    positions_sample = sample_positions(positions, max_halos=max_correlation_halos)
-    plot_correlation_function(positions_sample, box_size,
-        output=output_dir / "subhalo_correlation_function.png")
