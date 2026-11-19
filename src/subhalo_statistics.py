@@ -11,6 +11,7 @@ import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy import units
+from matplotlib.colors import LogNorm
 from scipy.spatial import cKDTree
 
 # -------------- DATA ----------------
@@ -270,5 +271,54 @@ def plot_correlation_function(
     axs[0].legend()
 
     fig.tight_layout()
+    if output is not None:
+        fig.savefig(output)
+
+
+def plot_column_density(positions, n_bins=200, output=None):
+    """Plot subhalo number column density in the XY, XZ, and YZ planes."""
+    positions = np.asarray(positions, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3 or len(positions) == 0:
+        raise ValueError("positions must be a non-empty array with shape (N, 3)")
+    if not np.isfinite(positions).all():
+        raise ValueError("positions must contain only finite values")
+
+    projections = ((0, 1), (0, 2), (1, 2))
+    coordinates = ("x", "y", "z")
+    densities = []
+    bin_edges = []
+    for axis_x, axis_y in projections:
+        density, x_edges, y_edges = np.histogram2d(
+            positions[:, axis_x], positions[:, axis_y], bins=n_bins
+        )
+        pixel_areas = np.diff(x_edges)[:, None] * np.diff(y_edges)[None, :]
+        densities.append(density / pixel_areas)
+        bin_edges.append((x_edges, y_edges))
+
+    positive = np.concatenate([density[density > 0] for density in densities])
+    vmin, vmax = positive.min(), positive.max()
+    if vmin == vmax:
+        vmax = np.nextafter(vmax, np.inf)
+    norm = LogNorm(vmin=vmin, vmax=vmax)
+
+    fig, axs = plt.subplots(ncols=3, figsize=(15, 5), constrained_layout=True)
+    for ax, (axis_x, axis_y), density, (x_edges, y_edges) in zip(
+        axs, projections, densities, bin_edges
+    ):
+        mesh = ax.pcolormesh(
+            x_edges,
+            y_edges,
+            np.ma.masked_equal(density.T, 0),
+            shading="auto",
+            norm=norm,
+            cmap="magma",
+        )
+        ax.set_xlabel(f"${coordinates[axis_x]}$ [cMpc]")
+        ax.set_ylabel(f"${coordinates[axis_y]}$ [cMpc]")
+        ax.set_title(f"{coordinates[axis_x].upper()}{coordinates[axis_y].upper()} plane")
+
+    fig.colorbar(
+        mesh, ax=axs, label=r"column density [$\mathrm{cMpc}^{-2}$]"
+    )
     if output is not None:
         fig.savefig(output)
