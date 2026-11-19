@@ -1,6 +1,7 @@
 # BLUE, RED, GREEN, YELLOW, BLACK
 axes.prop_cycle : cycler('color', ['0C5DA5', 'FF2C00', '00B945', 'FF9500', '1F1F1F'])
 
+image.cmap : magma
 
 figure.figsize : 7.20, 4.80
 figure.dpi : 300
