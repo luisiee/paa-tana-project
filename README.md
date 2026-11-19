@@ -21,3 +21,5 @@ As these files are untracked by git, they must be manually added to your local c
 |   |-- TNG50-1-Dark_subhalosCat.hdf5
 |   |-- cutout_188106.hdf5
 ```
+
+The discussion for **Part 1** of the project can be found in the pdf file `part1.pdf` or jupyter notebook `part1.ipynb`. Figures can be found in the `figures/` directory, and are reproduced by running the notebooks. Figures use the [nice-figures](https://github.com/luisiee/nice-figures) matplotlib style. The source code can be found in the `src/` directory.

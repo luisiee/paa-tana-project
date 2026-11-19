@@ -172,7 +172,7 @@ def plot_mass_function(
                 fit_masses,
                 10 ** (slope * np.log10(fit_masses) + intercept),
                 "--",
-                label=f"power-law fit (slope = {slope:.2f})",
+                label=f"power-law fit ($n \\geq$ {min_cumulative_density:.1e}, slope = {slope:.2f})",
             )
             axs[1].legend()
         else:
@@ -260,7 +260,7 @@ def plot_correlation_function(
                 fit_radii,
                 10 ** (slope * np.log10(fit_radii) + intercept),
                 "--",
-                label=f"natural fit ($\\xi \\leq {xi_fit_max:g}$, slope = {slope:.2f})",
+                label=f"natural fit ($\\xi \\leq$ {xi_fit_max:g}, slope = {slope:.2f})",
             )
     else:
         print(
