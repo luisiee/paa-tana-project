@@ -20,7 +20,7 @@ from galpy.util import conversion
 from scipy.optimize import curve_fit
 
 
-def potential_plotter(file, plot=True, output=None):
+def spherical_potential_plotter(file, plot=True, output=None):
     """
     Builds a spherical potential from the DM particles in 'file' and plots the potential and density
 
@@ -146,7 +146,7 @@ def data_fitter(file, plot=True, output=None):
     """
 
     # Extract potential and density from the data
-    _, r, rho, _ = potential_plotter(file, plot=False)
+    _, r, rho, _ = spherical_potential_plotter(file, plot=False)
 
     # galpy's unit scales as plain numbers (kpc, km/s), only used to construct the fit models
     ro, vo = 8.0, 220.0
@@ -248,7 +248,7 @@ def data_fitter(file, plot=True, output=None):
         ax.loglog(r.value, rho.value, "k", lw=2, label="galpy density")
         for name, (rho_model, rms) in results_density.items():
             ax.loglog(r.value, rho_model, "--", label=name)
-        ax.set(xlabel="r [kpc]", ylabel=r"$\rho$ [M$_\odot$ kpc$^{-3}$]", title="All fits")
+        ax.set(xlabel="r [kpc]", ylabel=r"$\rho$ [M$_\odot$ kpc$^{-3}$]", title="Density fits")
         ax.set_ylim(ymin, ymax)
         ax.legend()
 
@@ -520,7 +520,7 @@ def velocity_dispersions(file, n_bins=20, plot=True, return_counts=False, output
     return r_mid, sigma_r, sigma_t
 
 
-def tangential_velocity(file, n_bins=15):
+def tangential_velocity(file, n_bins=15, r_range=None):
     """
     Measures the full tangential velocity v_t of the DM particles as a function of radius, in
     logarithmic spherical shells. v_t is the speed perpendicular to the radial direction,
@@ -576,7 +576,11 @@ def tangential_velocity(file, n_bins=15):
     v_t = np.sqrt(np.maximum(np.sum(v**2, axis=1) - v_r**2, 0.))
 
     # Logarithmic shells, from the 100th particle (as before, inside that it is noise) to the outermost
-    edges = np.geomspace(np.sort(r)[100], r.max(), n_bins + 1)
+    # if r_range specified: from r_range[0] to r_range[1]
+    if r_range is None:
+        edges = np.geomspace(np.sort(r)[100], r.max(), n_bins + 1)
+    else:
+        edges = np.geomspace(r_range[0].to_value(u.kpc), r_range[1].to_value(u.kpc), n_bins + 1)
     shell = np.digitize(r, edges) - 1
 
     vt_mean = np.full(n_bins, np.nan)
@@ -626,7 +630,7 @@ def compare_rotation_curves(file, n_bins=15, plot=True, output=None):
 
     # 2) From the enclosed mass: v_c = sqrt(G M(<r) / r). The enclosed mass is the fourth output of
     # potential_plotter, on the same radius grid as the model
-    _, r_M, _, M = potential_plotter(file, plot=False)
+    _, r_M, _, M = spherical_potential_plotter(file, plot=False)
     vc_mass = np.sqrt(const.G * M / r_M).to(u.km / u.s)
 
     # 3) The tangential velocities of the particles
@@ -651,3 +655,412 @@ def compare_rotation_curves(file, n_bins=15, plot=True, output=None):
             fig.savefig(output)
 
     return (r, vc_model), (r_M, vc_mass), (r_t, vt_mean, vt_rms)
+
+
+# ------------ ASYMMETRIC POTENTIALS ----------------
+
+def build_scf(file, N=10, L=4, n_r=40, n_dir=200, n_shells=20, plot=True, output=None):
+    """
+    Builds a galpy SCF (basis-function expansion) potential directly from the DM particles,
+    with no spherical symmetry assumption, and optionally plots how spherical it is.
+
+    N : number of radial terms
+    L : number of angular terms (L = 0 is spherical)
+    """
+    ro, vo = 8.0, 220.0
+
+    with h5py.File(file, "r") as f:
+        hdr = dict(f["Header"].attrs)
+        pos = f["PartType1/Coordinates"][:]
+        m = np.full(len(pos), hdr["MassTable"][1])
+
+    h = hdr.get("HubbleParam", 1.0)
+    L_unit = hdr.get("UnitLength_in_cm", 3.085678e21) * u.cm / h
+    M_unit = hdr.get("UnitMass_in_g", 1.989e43) * u.g / h
+
+    pos = pos * L_unit.to(u.kpc)
+    m = m * M_unit.to(u.Msun)
+
+    x = pos - pos.mean(axis=0)
+    r_part = np.sort(np.linalg.norm(x.value, axis=1)) # sorted particle radii in kpc
+    # Scale radius of the basis: the median radius works as a starting point
+    a_phys = np.median(r_part) * u.kpc
+
+    # SCF works in galpy natural units
+    x_nat = conversion.parse_length(x, ro=ro, vo=vo)
+    m_nat = conversion.parse_mass(m, ro=ro, vo=vo)
+    a_nat = conversion.parse_length(a_phys, ro=ro, vo=vo)
+
+    # Expansion coefficients from the particles; pos must have shape (3, N_particles)
+    Acos, Asin = scf_compute_coeffs_nbody(x_nat.T, N, L, mass=m_nat, a=a_nat)
+    pot_scf = SCFPotential(Acos=Acos, Asin=Asin, a=a_nat, ro=ro, vo=vo)
+    # Added this before the loop as well, now you can get it without having to plot everything
+    r_ax = np.geomspace(r_part[100], r_part[-1], 60) * u.kpc
+
+    if plot:
+        pot_unit = u.km**2 / u.s**2
+        rho_unit = u.Msun / u.kpc**3
+
+        # --- Potential along the three coordinate axes ---
+        tiny = 1e-6 * r_ax # galpy works in cylindrical coords, so the z axis needs R ~ 0
+        zero = 0.0 * u.kpc
+        Phi_x = evaluatePotentials(pot_scf, r_ax, zero, phi=0. * u.rad, quantity=True).to(pot_unit)
+        Phi_y = evaluatePotentials(pot_scf, r_ax, zero, phi=90. * u.deg, quantity=True).to(pot_unit)
+        Phi_z = evaluatePotentials(pot_scf, tiny, r_ax, phi=0. * u.rad, quantity=True).to(pot_unit)
+        Phi_axes = {"x axis": Phi_x, "y axis": Phi_y, "z axis": Phi_z}
+        Phi_mean = (Phi_x + Phi_y + Phi_z) / 3
+
+        # Spherical averages: many directions at each radius
+        r_grid = np.geomspace(r_part[100], r_part[-1], n_r)
+
+        # Directions spread evenly over the sphere (Fibonacci spiral)
+        i = np.arange(n_dir) + 0.5
+        cos_t = 1 - 2 * i / n_dir
+        sin_t = np.sqrt(1 - cos_t**2)
+        phi_dir = np.pi * (1 + np.sqrt(5)) * i
+
+        # Cylindrical coordinates of every (radius, direction) pair, shape (n_r, n_dir)
+        R = (r_grid[:, None] * sin_t[None, :]).ravel() * u.kpc
+        z = (r_grid[:, None] * cos_t[None, :]).ravel() * u.kpc
+        phi = np.tile(phi_dir, n_r) * u.rad
+
+        Phi_all = evaluatePotentials(pot_scf, R, z, phi=phi, quantity=True).to_value(pot_unit).reshape(n_r, n_dir)
+        rho_all = evaluateDensities(pot_scf, R, z, phi=phi, quantity=True).to_value(rho_unit).reshape(n_r, n_dir)
+
+        Phi_spherical = Phi_all.mean(axis=1) * pot_unit
+        rho_spherical = rho_all.mean(axis=1) * rho_unit
+
+        # Density measured directly from the particles, in logarithmic shells
+        edges = np.geomspace(r_part[100], r_part[-1], n_shells + 1)
+        counts, _ = np.histogram(r_part, bins=edges)
+        m_part = (hdr["MassTable"][1] * M_unit.to(u.Msun)).value
+        rho_part = counts * m_part / (4 / 3 * np.pi * (edges[1:]**3 - edges[:-1]**3))
+        r_shell = np.sqrt(edges[1:] * edges[:-1])
+
+        # ---------- PLOTTING ------------
+        fig, ax = plt.subplots(2, 2, figsize=(12, 10))
+
+        # 1. POTENTIAL ALONG AXES
+        for name, Phi in Phi_axes.items():
+            ax[0, 0].semilogx(r_ax.value, Phi.value, label=name)
+        ax[0, 0].set(xlabel="r [kpc]", ylabel=r"$\Phi$ [(km/s)$^2$]", title="Potential along the axes")
+        ax[0, 0].legend()
+
+        # 2. POTENTIAL DIFFERENCE WITH MEAN ALONG AXES
+        for name, Phi in Phi_axes.items():
+            ax[0, 1].semilogx(r_ax.value, ((Phi - Phi_mean) / np.abs(Phi_mean)).decompose().value * 100,
+                label=name)
+        ax[0, 1].axhline(0, color="k", lw=0.5)
+        ax[0, 1].set(xlabel="r [kpc]", ylabel="deviation from the mean [%]",
+                     title="Deviation between axes")
+        ax[0, 1].legend()
+
+        # 3. POTENTIAL, SPHERICAL AVERAGE
+        ax[1, 0].semilogx(r_grid, Phi_spherical.value, label="spherical average")
+        lo, hi = np.percentile(Phi_all, [16, 84], axis=1)
+        ax[1, 0].fill_between(r_grid, lo, hi, alpha=0.3, label="16-84 percentile")
+        ax[1, 0].set(xlabel="r [kpc]", ylabel=r"$\Phi$ [(km/s)$^2$]",
+                     title="Potential, spherical average")
+        ax[1, 0].legend()
+
+        # 4. DENSITY, SPHERICAL AVERAGE
+        ax[1, 1].loglog(r_grid, np.where(rho_spherical.value > 0, rho_spherical.value, np.nan),
+                        label="SCF - spherical average")
+        lo, hi = np.percentile(rho_all, [16, 84], axis=1)
+        ax[1, 1].fill_between(r_grid, np.where(lo > 0, lo, np.nan), np.where(hi > 0, hi, np.nan),
+            alpha=0.3, label="SCF - 16-84 percentile")
+        ax[1, 1].loglog(r_shell, rho_part, "ks", label="data - in log shells")
+        ax[1, 1].set(xlabel="r [kpc]",
+                     ylabel=r"$\rho$ [M$_\odot$ kpc$^{-3}$]",
+                     title="Density, spherical average")
+        ax[1, 1].legend()
+
+        fig.tight_layout()
+        if output is not None:
+            fig.savefig(output)
+
+    return pot_scf, r_ax
+
+
+def plot_potential_density_scf_2d(pot_scf, file, n_r=40, n_dir=200, plot=True, output=None):
+    """
+    Plots equipotential and density maps of an SCF potential in the x-y and x-z planes.
+
+    Parameters:
+
+    pot_scf : galpy.potential
+              The SCF potential, e.g. from build_SCF
+
+    file : .hdf5 file
+           Data from the TNG simulation (one halo), the same file that was used for pot_scf
+
+    n_r : int
+          Number of radii for the spherical averages
+
+    n_dir : int
+            Number of directions, spread evenly over the sphere, to average over at each radius
+
+    n_shells : int
+               Number of logarithmic shells for the density measured from the particles
+
+    plot : bool
+           Whether to plot
+
+    Returns:
+
+    r_grid : astropy Quantity
+             Radii (kpc) of the averaged profiles
+
+    Phi_mean : astropy Quantity
+               Potential (km^2/s^2) averaged over all directions
+
+    rho_mean : astropy Quantity
+               Density (Msun/kpc^3) averaged over all directions
+    """
+    pot_unit = u.km**2 / u.s**2
+    rho_unit = u.Msun / u.kpc**3
+
+    with h5py.File(file, "r") as f:
+        hdr = dict(f["Header"].attrs)
+        pos = f["PartType1/Coordinates"][:]
+    h = hdr.get("HubbleParam", 1.0)
+    L_unit = hdr.get("UnitLength_in_cm", 3.085678e21) * u.cm / h
+
+    pos = pos * L_unit.to(u.kpc)
+    x = (pos - pos.mean(axis=0)).value
+    r_part = np.sort(np.linalg.norm(x, axis=1))
+    r_grid = np.geomspace(r_part[100], r_part[-1], n_r)
+
+    i = np.arange(n_dir) + 0.5
+    cos_t = 1 - 2 * i / n_dir
+    sin_t = np.sqrt(1 - cos_t**2)
+    phi_dir = np.pi * (1 + np.sqrt(5)) * i
+
+    R = (r_grid[:, None] * sin_t[None, :]).ravel() * u.kpc
+    z = (r_grid[:, None] * cos_t[None, :]).ravel() * u.kpc
+    phi = np.tile(phi_dir, n_r) * u.rad
+
+    Phi_all = evaluatePotentials(pot_scf, R, z, phi=phi, quantity=True).to_value(pot_unit).reshape(n_r, n_dir)
+    rho_all = evaluateDensities(pot_scf, R, z, phi=phi, quantity=True).to_value(rho_unit).reshape(n_r, n_dir)
+
+    Phi_mean = Phi_all.mean(axis=1) * pot_unit
+    rho_mean = rho_all.mean(axis=1) * rho_unit
+
+    if plot:
+        lim = np.percentile(r_part, 90)
+        g = np.linspace(-lim, lim, 60)
+        X, Y = np.meshgrid(g, g)
+
+        R_xy = np.hypot(X, Y).ravel() * u.kpc
+        z_xy = np.zeros(X.size) * u.kpc
+        phi_xy = np.arctan2(Y, X).ravel() * u.rad
+
+        R_xz = np.abs(X).ravel() * u.kpc
+        z_xz = Y.ravel() * u.kpc
+        phi_xz = np.where(X.ravel() >= 0, 0., np.pi) * u.rad
+
+        maps = {}
+        for name, (Rm, zm, pm) in {"x-y": (R_xy, z_xy, phi_xy), "x-z": (R_xz, z_xz, phi_xz)}.items():
+            maps[name] = (
+                evaluatePotentials(pot_scf, Rm, zm, phi=pm, quantity=True).to_value(pot_unit).reshape(X.shape),
+                evaluateDensities(pot_scf, Rm, zm, phi=pm, quantity=True).to_value(rho_unit).reshape(X.shape))
+
+        fig, ax = plt.subplots(2, 2, figsize=(12, 10))
+
+        for a, name, ylab in [(ax[0, 0], "x-y", "y [kpc]"), (ax[0, 1], "x-z", "z [kpc]")]:
+            cs = a.contour(g, g, maps[name][0], levels=15)
+            a.clabel(cs, fontsize=7, fmt="%.0f")
+            a.set(xlabel="x [kpc]", ylabel=ylab, title=f"Equipotentials, {name} plane", aspect="equal")
+
+        for a, name, ylab in [(ax[1, 0], "x-y", "y [kpc]"), (ax[1, 1], "x-z", "z [kpc]")]:
+            rho_map = np.ma.masked_less_equal(maps[name][1], 0)
+            cf = a.contourf(g, g, np.log10(rho_map), levels=20)
+            fig.colorbar(cf, ax=a, label=r"log$_{10}$ $\rho$ [M$_\odot$ kpc$^{-3}$]")
+            a.set(xlabel="x [kpc]", ylabel=ylab, title=f"Density, {name} plane", aspect="equal")
+
+        fig.tight_layout()
+        if output is not None:
+            fig.savefig(output)
+
+    return r_grid * u.kpc, Phi_mean, rho_mean
+
+
+def integrate_orbits_scf(pot, r0, f_vc=(1.0, 0.7, 0.4), n_orbits=5, n_steps=1000,
+                     ro=8.0, vo=220.0, plot=True, output=None):
+    """
+    Integrates orbits in a galpy potential, spherical or not, and optionally plots them together with
+    their energy. Every orbit starts at radius r0 on the x axis in the z = 0 plane (phi = 0), with a
+    purely tangential velocity f * v_c(r0).
+
+    Parameters:
+
+    pot : galpy.potential
+          The potential, e.g. pot_scf from build_SCF or pot_einasto from build_Einasto
+
+    r0 : astropy Quantity
+         Starting radius (kpc), should be inside the range covered by the particles.
+
+    f_vc : sequence of float
+           Tangential velocity of each orbit as a fraction of the circular velocity at r0 (at phi = 0).
+           1.0 is a circular orbit in the plane. Smaller values give more eccentric orbits.
+
+    n_orbits : float
+               Integration time in units of the circular orbital period at r0
+
+    n_steps : int
+              Number of time steps
+
+    ro, vo : float
+             galpy's unit scales (kpc, km/s), must be the same as used for the potential
+
+    plot : bool
+           Whether to plot the orbits and their energy
+
+    Returns:
+
+    orbits : list of galpy.orbit.Orbit
+             The integrated orbits, one for each value in f_vc
+
+    ts : list of astropy Quantity
+         The times (Gyr) at which each orbit was integrated
+
+    """
+    # Circular velocity at the starting point (phi = 0), where all the orbits start
+    vc0 = vcirc(pot, r0, phi=0. * u.rad, quantity=True).to(u.km / u.s)
+
+    # Integrate for n_orbits circular periods at r0
+    T = n_orbits * (2 * np.pi * r0 / vc0).to(u.Gyr)
+    ts = np.linspace(0, T.to_value(u.Gyr), n_steps) * u.Gyr
+
+    orbits = []
+    for f in f_vc:
+        # [R, vR, vT, z, vz, phi]: purely tangential velocity, starting in the z = 0 plane
+        o = Orbit([r0, 0. * u.km / u.s, f * vc0, 0. * u.kpc, 0. * u.km / u.s, 0. * u.rad],
+                  ro=ro, vo=vo)
+        o.integrate(ts, pot)
+        orbits.append(o)
+
+    if plot:
+        fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+
+        for f, o in zip(f_vc, orbits):
+            x = o.x(ts, quantity=True).to_value(u.kpc)
+            y = o.y(ts, quantity=True).to_value(u.kpc)
+            z = o.z(ts, quantity=True).to_value(u.kpc)
+            label = rf"$v_T = {f:.2f}\,v_c$"
+
+            ax[0].plot(x, y, label=label)
+            ax[1].plot(x, z, label=label)
+
+        ax[0].set(xlabel="x [kpc]", ylabel="y [kpc]", title="Orbits, x-y projection", aspect="equal")
+        ax[1].set(xlabel="x [kpc]", ylabel="z [kpc]", title="Orbits, x-z projection", aspect="equal")
+        for a in ax:
+            a.legend()
+
+        fig.tight_layout()
+        if output is not None:
+            fig.savefig(output)
+
+    return orbits, [ts] * len(orbits)
+
+
+def circular_velocity_scf(pot_scf, r, n_phi=8):
+    """
+    Computes the circular velocity v_c(r) of an SCF potential with galpy's vcirc, in the z = 0 plane.
+    The SCF potential is not axisymmetric, so v_c depends on the azimuth. It is computed at 'n_phi'
+    azimuths and averaged.
+
+    Parameters:
+
+    pot_scf : galpy.potential
+              The SCF potential, e.g. from build_SCF
+
+    r : astropy Quantity
+        Radii (kpc) at which to evaluate v_c, within the range covered by the particles
+
+    n_phi : int
+            Number of azimuths (evenly spaced between 0 and 2 pi) to average over
+
+    Returns:
+
+    vc : astropy Quantity
+         The azimuthally averaged circular velocity (km/s) at the radii in 'r'
+
+    """
+    phis = np.linspace(0., 2 * np.pi, n_phi, endpoint=False) * u.rad
+    # Circular velocity at every azimuth, shape (n_phi, len(r))
+    vc_phi = np.array([vcirc(pot_scf, r, phi=phi, quantity=True).to_value(u.km / u.s) for phi in phis])
+    vc = vc_phi.mean(axis=0) * u.km / u.s
+    return vc_phi, vc
+
+
+def compare_rotation_curves_scf(file, n_bins=15, plot=True, output=None):
+    """
+    Plots the circular velocity v_c(r) of the halo from the SCF potential and from the enclosed mass,
+    together with the tangential velocity v_t of the particles.
+
+    1) directly from the SCF potential, with vcirc in the z = 0 plane averaged over azimuth
+    2) from the enclosed mass of the particles, v_c = sqrt(G M(<r) / r)
+    3) the tangential velocity v_t of the particles (the speed perpendicular to the radial direction)
+
+    Parameters:
+
+    file : .hdf5 file
+           Data from the TNG simulation (one halo)
+
+    n_bins : int
+             Number of logarithmic radial shells for the particle velocities
+
+    plot : bool
+           Whether to plot the curves
+
+    Returns:
+
+    (r_ax, vc_model) : radii and circular velocity from the SCF potential
+    (r_ax, vc_mass) : radii and circular velocity from the enclosed mass
+    (r_t, vt_mean, vt_rms) : shell centers, mean v_t and rms v_t of the particles
+    all as astropy Quantities (kpc and km/s)
+
+    """
+    # 1) Directly from the SCF potential, on the radius grid that build_SCF returns
+    pot_scf, r_ax = build_scf(file, plot=False)
+    vc_phi_model, vc_model = circular_velocity_scf(pot_scf, r_ax)
+
+    # 2) From the enclosed mass: v_c = sqrt(G M(<r) / r). The enclosed mass is the fourth output of
+    # potential_plotter, which is interpolated onto the SCF radius grid (both span the same range)
+    _, r_M, _, M = spherical_potential_plotter(file, plot=False)
+    M_ax = np.interp(r_ax, r_M, M)
+    vc_mass = np.sqrt(const.G * M_ax / r_ax).to(u.km / u.s)
+
+    # 3) The tangential velocities of the particles
+    r_range = np.array([r_ax[0].to_value(u.kpc), r_ax[-1].to_value(u.kpc)]) * u.kpc
+    r_t, vt_mean, vt_rms = tangential_velocity(file, n_bins=n_bins, r_range=r_range)
+
+    if plot:
+        fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
+        axs[1].semilogx(r_ax.to_value(u.kpc), vc_model.to_value(u.km / u.s), label="fit - SCF")
+        axs[1].semilogx(r_ax.to_value(u.kpc), vc_mass.to_value(u.km / u.s), "--",
+                     label=r"data - enclosed mass")
+        axs[1].semilogx(r_t.to_value(u.kpc), vt_mean.to_value(u.km / u.s), "o-",
+                     label=r"data - mean $|v_t|$")
+        axs[1].semilogx(r_t.to_value(u.kpc), vt_rms.to_value(u.km / u.s), "s-",
+                     label=r"data - rms $v_t$")
+        axs[1].set_xlabel("r [kpc]")
+        axs[1].set_ylabel("velocity [km/s]")
+        axs[1].set_title("Comparison")
+        axs[1].legend()
+
+        axs[0].semilogx(r_ax.to_value(u.kpc), vc_model.value, label="azimuthal mean")
+        # Spread between azimuths: it shows the asymmetry of the potential in the plane
+        lo, hi = np.percentile(vc_phi_model, [16, 84], axis=0)
+        axs[0].fill_between(r_ax.to_value(u.kpc), lo, hi, alpha=0.3, label="16-84% over azimuth")
+        axs[0].set_xlabel("r [kpc]")
+        axs[0].set_ylabel(r"$v_c$ [km/s]")
+        axs[0].set_title("Circular velocity, SCF potential")
+        axs[0].legend()
+
+        fig.tight_layout()
+        if output is not None:
+            fig.savefig(output)
+
+    return (r_ax, vc_model), (r_ax, vc_mass), (r_t, vt_mean, vt_rms)
