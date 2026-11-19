@@ -148,7 +148,7 @@ def plot_mass_function(
 
     fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
     good = counts > 0
-    axs[0].plot(10**centers[good], dn_dlogm[good], "D-")
+    axs[0].plot(10**centers[good], dn_dlogm[good], "s-")
     axs[0].set_xlabel(r"$M_{\rm sub}$ $[M_\odot]$")
     axs[0].set_ylabel(r"$dn/d\log_{10}(M/M_\odot)$ $[\mathrm{cMpc}^{-3}]$")
     axs[0].set_title("Subhalo mass function")
@@ -227,15 +227,15 @@ def plot_correlation_function(
     reduced_chi2s = np.sum((low_naturals - low_ls)**2, axis=1, keepdims=False) / len(radii)
 
     fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
-    axs[0].plot(radii[ok_nat], natural[ok_nat], "D-", label="natural (analytic RR)")
-    axs[0].plot(radii[ok_ls], ls[ok_ls], "s-", label="Landy–Szalay")
+    axs[0].plot(radii[ok_nat], natural[ok_nat], "s-", label="natural (analytic RR)")
+    axs[0].plot(radii[ok_ls], ls[ok_ls], "o-", label="Landy–Szalay")
     axs[0].set_xscale("log")
     axs[0].set_yscale("log")
     axs[0].set_xlabel(r"$r$ [$\mathrm{cMpc}$]")
     axs[0].set_ylabel(r"$\xi(r)$")
     axs[0].set_title("Subhalo autocorrelation function")
 
-    axs[1].plot(np.array([1.0, 0.8, 0.6, 0.4, 0.2]), reduced_chi2s, "D-")
+    axs[1].plot(np.array([1.0, 0.8, 0.6, 0.4, 0.2]), reduced_chi2s, "s-")
     axs[1].set_yscale("log")
     axs[1].set_xlabel(r"$N_\mathrm{R} / N_\mathrm{D}$")
     axs[1].set_ylabel(r"$\sum_r (\xi_\mathrm{LS}(r) - \xi_\mathrm{nat}(r))^2 / N_\mathrm{bins}$")
