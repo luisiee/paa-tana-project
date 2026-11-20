@@ -66,16 +66,42 @@ def _wrap(positions, box_size):
 
 def _pair_histogram(tree_a, tree_b, edges, same_catalog=False):
     """Count pairs in radial shells using cKDTree's cumulative pair counter."""
-    cumulative = np.asarray(
-        tree_a.count_neighbors(tree_b, edges, cumulative=True), dtype=np.int64
-    )
+    pairs = np.asarray(
+        tree_a.count_neighbors(tree_b, edges, cumulative=False), dtype=np.int64
+    )[1:] # first element contains r < rmin, we don't need this
     if same_catalog:
-        # remove the N self-pairs, then halve the ordered pairs (ij and ji)
-        cumulative = (cumulative - tree_a.n) // 2
-    return np.diff(cumulative)
+        # halve the ordered pairs (ij and ji), double counting
+        pairs = pairs // 2
+    return pairs
 
 
-def get_correlation_estimators(
+def get_correlation_estimator(positions, box_size, rmin=0.1, rmax=None, bins=16):
+    """Natural (analytic RR) xi(r) in periodic spherical shells."""
+    positions = np.asarray(positions, dtype=np.float64)
+    n_data = len(positions)
+    if n_data < 2:
+        raise ValueError("At least two subhalos are needed for a correlation function")
+    half_box = box_size / 2.0
+    if rmax is None:
+        rmax = 0.2 * box_size
+    if not (0 < rmin < rmax <= half_box):
+        raise ValueError("Require 0 < rmin < rmax <= BoxSize/2 for periodic shells")
+
+    edges = np.geomspace(rmin, rmax, bins + 1)
+    centers = np.sqrt(edges[:-1] * edges[1:])
+
+    # larger leaf size for large rmax
+    data_tree = cKDTree(_wrap(positions, box_size), boxsize=box_size, balanced_tree=False, leafsize=48)
+    dd = _pair_histogram(data_tree, data_tree, edges, same_catalog=True)
+    dd_norm = dd / (n_data * (n_data - 1) / 2)
+    rr_norm = (4.0 * np.pi / 3.0) * np.diff(edges**3) / box_size**3
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        natural = dd_norm / rr_norm - 1.0
+    return centers, natural
+
+
+def get_correlation_estimator_comparison(
     positions,
     box_size,
     rmin=0.1,
@@ -91,20 +117,20 @@ def get_correlation_estimators(
         raise ValueError("At least two subhalos are needed for a correlation function")
     half_box = box_size / 2.0
     if rmax is None:
-        rmax = 0.45 * half_box
+        rmax = 0.2 * box_size
     if not (0 < rmin < rmax <= half_box):
         raise ValueError("Require 0 < rmin < rmax <= BoxSize/2 for periodic shells")
 
     edges = np.geomspace(rmin, rmax, bins + 1)
     centers = np.sqrt(edges[:-1] * edges[1:])
 
-    data_tree = cKDTree(_wrap(positions, box_size), boxsize=box_size)
+    data_tree = cKDTree(_wrap(positions, box_size), boxsize=box_size, balanced_tree=False, leafsize=32)
     dd = _pair_histogram(data_tree, data_tree, edges, same_catalog=True)
 
     # random catalogue, between random_to_sim * n_data and max_random points
     n_random = min(int(random_to_sim * n_data), max_random)
     rng = np.random.default_rng(rng_seed)
-    random_tree = cKDTree(rng.uniform(0.0, box_size, size=(n_random, 3)), boxsize=box_size)
+    random_tree = cKDTree(rng.uniform(0.0, box_size, size=(n_random, 3)), boxsize=box_size, leafsize=32)
     dr = _pair_histogram(data_tree, random_tree, edges)
     rr = _pair_histogram(random_tree, random_tree, edges, same_catalog=True)
 
@@ -195,14 +221,14 @@ def plot_mass_function(
         fig.savefig(output)
 
 
-def plot_correlation_function(
+def plot_correlation_function_comparison(
     positions, box_size, output=None, xi_fit_max=8.0, **kwargs
 ):
     """Plot correlation estimators and fit the natural estimator below xi_fit_max."""
     if not np.isfinite(xi_fit_max) or xi_fit_max <= 0:
         raise ValueError("xi_fit_max must be a finite positive value")
 
-    radii, natural, ls = get_correlation_estimators(
+    radii, natural, ls = get_correlation_estimator_comparison(
         positions, box_size, **kwargs
     )
 
@@ -221,7 +247,7 @@ def plot_correlation_function(
     low_naturals[0] = natural
     low_ls[0] = ls
     for i, random_to_sim in enumerate([0.8, 0.6, 0.4, 0.2]):
-        _, this_natural, this_ls = get_correlation_estimators(positions, box_size, random_to_sim=random_to_sim, **kwargs)
+        _, this_natural, this_ls = get_correlation_estimator_comparison(positions, box_size, random_to_sim=random_to_sim, **kwargs)
         low_naturals[i+1] = this_natural
         low_ls[i+1] = this_ls
 
@@ -266,6 +292,125 @@ def plot_correlation_function(
     else:
         print(
             f"Note: fewer than two finite positive natural-estimator bins have "
+            f"xi <= {xi_fit_max:g}; skipping the fit."
+        )
+    axs[0].legend()
+
+    fig.tight_layout()
+    if output is not None:
+        fig.savefig(output)
+
+
+def plot_correlation_function(
+    positions,
+    masses,
+    box_size,
+    n_positions=20_000,
+    min_masses=(1e8, 1e9, 1e10),
+    output=None,
+    xi_fit_max=8.0,
+    rng_seed=42,
+    **kwargs,
+):
+    """Compare a uniform position sample with three mass-threshold samples."""
+    if not np.isfinite(xi_fit_max) or xi_fit_max <= 0:
+        raise ValueError("xi_fit_max must be a finite positive value")
+
+    positions = np.asarray(positions, dtype=np.float64)
+    masses = np.asarray(masses, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("positions must have shape (N, 3)")
+    if masses.ndim != 1 or len(masses) != len(positions):
+        raise ValueError("masses must be a one-dimensional array aligned with positions")
+    if not np.isfinite(masses).all():
+        raise ValueError("masses must contain only finite values")
+    if not isinstance(n_positions, (int, np.integer)) or n_positions < 2:
+        raise ValueError("n_positions must be an integer of at least two")
+    if n_positions > len(positions):
+        raise ValueError(
+            f"n_positions ({n_positions}) cannot exceed the number of positions "
+            f"({len(positions)})"
+        )
+
+    sample = sample_positions(positions, max_halos=n_positions, rng_seed=rng_seed)
+    radii, xi = get_correlation_estimator(sample, box_size, **kwargs)
+
+    # xi is on a log y-axis, so only strictly positive, finite values can be drawn
+    ok = np.isfinite(xi) & (xi > 0)
+    if (~ok).any():
+        print(
+            f"Note: omitted {(~ok).sum()} uniform-sample bins with xi <= 0 "
+            " (cannot be shown on a log axis)."
+        )
+
+    fig, axs = plt.subplots(ncols=2, figsize=(10, 5))
+    axs[0].plot(
+        radii[ok],
+        xi[ok],
+        "s-",
+        label=f"uniform sample ($N={len(sample):,}$)",
+    )
+    axs[0].set_xscale("log")
+    axs[0].set_yscale("log")
+    axs[0].set_xlabel(r"$r$ [$\mathrm{cMpc}$]")
+    axs[0].set_ylabel(r"$\xi(r)$")
+    axs[0].set_title("Uniform position subsample")
+
+    for min_mass in min_masses:
+        selected = positions[masses > min_mass]
+        if len(selected) < 2:
+            raise ValueError(
+                f"min_mass={min_mass:g} leaves fewer than two halos; "
+                "cannot compute a correlation function"
+            )
+        _, mass_xi = get_correlation_estimator(selected, box_size, **kwargs)
+        mass_ok = np.isfinite(mass_xi) & (mass_xi > 0)
+        if (~mass_ok).any():
+            print(
+                f"Note: omitted {(~mass_ok).sum()} bins for min_mass={min_mass:g} "
+                "(xi <= 0 cannot be shown on a log axis)."
+            )
+        axs[1].plot(
+            radii[mass_ok],
+            mass_xi[mass_ok],
+            "o-",
+            label=(
+                rf"$M_{{\rm sub}} > {min_mass:.1e}\,M_\odot$ "
+                f"($N={len(selected):,}$)"
+            ),
+        )
+
+    axs[1].set_xscale("log")
+    axs[1].set_yscale("log")
+    axs[1].set_xlabel(r"$r$ [$\mathrm{cMpc}$]")
+    axs[1].set_ylabel(r"$\xi(r)$")
+    axs[1].set_title("Mass-threshold subsamples")
+    axs[1].legend()
+
+    # Fit only the uniform position subsample.
+    fit_nat = ok & (xi <= xi_fit_max)
+    if fit_nat.sum() >= 2:
+        slope, intercept = np.polyfit(
+            np.log10(radii[fit_nat]), np.log10(xi[fit_nat]), deg=1
+        )
+        if slope != 0:
+            max_xi_radius = 10 ** (
+                (np.log10(xi[ok].max()) - intercept) / slope
+            )
+            fit_radii = np.geomspace(
+                min(max_xi_radius, radii[fit_nat].min()),
+                max(max_xi_radius, radii[fit_nat].max()),
+                100,
+            )
+            axs[0].plot(
+                fit_radii,
+                10 ** (slope * np.log10(fit_radii) + intercept),
+                "--",
+                label=f"fit ($\\xi \\leq$ {xi_fit_max:g}, slope = {slope:.2f})",
+            )
+    else:
+        print(
+            f"Note: fewer than two finite positive estimator bins have "
             f"xi <= {xi_fit_max:g}; skipping the fit."
         )
     axs[0].legend()
